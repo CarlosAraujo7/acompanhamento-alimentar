@@ -5,8 +5,10 @@
  * Por que isto é mais elaborado do que um fetch:
  *  - o app descobre (models.list) quais modelos a SUA chave enxerga e escolhe o melhor, em vez de
  *    depender de um nome fixo que pode sair do ar;
- *  - erros passageiros (503 "sobrecarregado", 429, rede) têm nova tentativa com espera;
- *  - se um modelo falha de vez (404, sem cota), passa para o próximo da lista;
+ *  - um modelo que trava (nome inexistente não dá erro, fica pendurado) não segura o app: se o melhor não responde
+ *    em poucos segundos, o próximo é disparado SEM largar o primeiro e vale quem responder antes ("hedge");
+ *  - erros definitivos (404, sem cota, travou) passam para o próximo na hora; o tempo total é limitado de verdade;
+ *  - erros passageiros (503, 429) ganham uma segunda rodada depois de uma pausa curta;
  *  - cada falha é registrada para a tela de diagnóstico mostrar o motivo real.
  */
 (function (g) {
@@ -16,7 +18,9 @@
   const P = g.PlanData;
 
   const BASE = 'https://generativelanguage.googleapis.com/v1beta';
-  const CACHE_KEY = 'plano-emagrecer-modelos';
+  const CACHE_KEY = 'plano-emagrecer-modelos-2';
+  // tempos (ms). Ajustáveis em Gemini.config (os testes usam valores menores)
+  const config = { attemptMs: 15000, hedgeMs: 8000, listMs: 2000, badMs: 6 * 3600 * 1000, slowMs: 30 * 60 * 1000 };
   const DAY_MS = 24 * 3600 * 1000;
   // fora desta lista ficam modelos de imagem, voz, embeddings, agentes etc.
   const SKIP = /tts|image|live|embed|robotics|transcribe|omni|computer|deep-research|antigravity|lyria|veo|imagen|banana|audio|aqa|learnlm|gemma|customtools/i;
@@ -50,7 +54,11 @@
       cache.write(c);
     },
   };
-  const resetCache = () => cache.write({});
+  // nova chave = outra lista de modelos: esquece o cache e qualquer consulta de lista em andamento
+  const resetCache = () => {
+    cache.write({});
+    listing = null;
+  };
 
   // ===========================================================================
   // Contexto do coach
@@ -202,8 +210,8 @@ ${JSON.stringify(ctx)}`;
       return { res, data };
     } catch (e) {
       if (outer && outer.aborted) throw new GeminiError('aborted', 'Cancelado.', 0, { fatal: true });
-      if (ctl.signal.aborted) throw new GeminiError('timeout', 'O Gemini demorou demais para responder.', 0, { retry: true });
-      throw new GeminiError('network', 'Sem conexão com o Gemini (ou o app foi para segundo plano durante o envio).', 0, { retry: true });
+      if (ctl.signal.aborted) throw new GeminiError('timeout', 'O modelo não respondeu a tempo.', 0);
+      throw new GeminiError('network', 'Sem conexão com o Gemini (ou o app foi para segundo plano durante o envio).', 0);
     } finally {
       clearTimeout(timer);
       if (outer) outer.removeEventListener('abort', onAbort);
@@ -264,7 +272,7 @@ ${JSON.stringify(ctx)}`;
     const { res, data } = await rawFetch(
       `${BASE}/models/${encodeURIComponent(model)}:generateContent`,
       { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: JSON.stringify(body) },
-      opts.timeoutMs || 45000,
+      opts.timeoutMs || config.attemptMs,
       opts.signal
     );
     if (!res.ok) throw classify(res.status, data);
@@ -286,12 +294,12 @@ ${JSON.stringify(ctx)}`;
     return 100 + (10 - parseFloat(m[1])) * 5 + tier + (/preview|exp/.test(id) ? 2 : 0);
   }
 
-  async function listModels(apiKey, signal) {
+  async function listModels(apiKey, signal, timeoutMs) {
     const out = [];
     let token = '';
     for (let page = 0; page < 4; page++) {
       const url = `${BASE}/models?pageSize=200${token ? `&pageToken=${encodeURIComponent(token)}` : ''}`;
-      const { res, data } = await rawFetch(url, { method: 'GET', headers: { 'x-goog-api-key': apiKey } }, 15000, signal);
+      const { res, data } = await rawFetch(url, { method: 'GET', headers: { 'x-goog-api-key': apiKey } }, timeoutMs || 10000, signal);
       if (!res.ok) throw classify(res.status, data);
       for (const m of (data && data.models) || []) {
         const id = String(m.name || '').replace(/^models\//, '');
@@ -303,39 +311,64 @@ ${JSON.stringify(ctx)}`;
     return out;
   }
 
-  /** Modelos a tentar, em ordem: o que você escolheu, o último que funcionou, depois os melhores disponíveis. */
-  async function candidates(apiKey, opts) {
+  let listing = null; // atualização da lista em andamento (uma só por vez)
+  function refreshList(apiKey) {
+    if (!listing) {
+      listing = listModels(apiKey, null, 10000)
+        .then((avail) => {
+          cache.patch((x) => {
+            x.list = avail;
+            x.ts = Date.now();
+          });
+          return avail;
+        })
+        .finally(() => {
+          listing = null;
+        });
+    }
+    return listing;
+  }
+
+  const isBad = (c, m) => c.bad && c.bad[m] && c.bad[m] > Date.now(); // bad[m] = até quando evitar
+  const markBad = (model, ms) =>
+    cache.patch((c) => {
+      c.bad = { ...(c.bad || {}), [model]: Date.now() + ms };
+    });
+
+  /**
+   * Modelos a tentar, em ordem: o que você escolheu, o último que funcionou, os comprovados, depois os demais.
+   * Nunca espera muito pela lista de modelos: sem cache, tenta a lista padrão já e atualiza a lista por baixo.
+   */
+  async function candidates(apiKey, opts, second) {
     const set = S.state.settings;
     const c = cache.read();
-    const bad = c.bad || {};
-    const isBad = (m) => bad[m] && Date.now() - bad[m] < 6 * 3600 * 1000;
     const list = [];
     const add = (m) => {
-      if (m && !list.includes(m) && !isBad(m)) list.push(m);
+      if (m && !list.includes(m) && !isBad(c, m)) list.push(m);
     };
     if (set.model && set.model !== 'auto') add(set.model);
     add(c.ok);
     let avail = c.list && c.ts && Date.now() - c.ts < DAY_MS ? c.list : null;
     if (!avail) {
+      const pending = refreshList(apiKey);
+      pending.catch(() => {}); // não deixa erro solto
       try {
-        avail = await listModels(apiKey, opts.signal);
-        cache.patch((x) => {
-          x.list = avail;
-          x.ts = Date.now();
-        });
+        avail = await Promise.race([pending, sleep(config.listMs, opts.signal).then(() => null)]);
       } catch (e) {
         if (e instanceof GeminiError && e.fatal) throw e; // chave inválida/bloqueada: não adianta seguir
-        avail = null; // lista indisponível: cai na lista padrão
+        avail = null;
       }
     }
-    const pool = avail && avail.length ? avail.slice().sort((a, b) => rank(a) - rank(b)) : P.MODEL_PREF.slice();
-    pool.forEach(add);
-    if (!list.length) {
-      // todos marcados como ruins (ex.: soluço temporário do Google): esquece as marcas e tenta a lista padrão
+    // modelos conhecidos e bons primeiro; os que a sua chave enxerga (se a lista chegou) completam
+    const known = avail && avail.length ? P.MODEL_PREF.filter((m) => avail.includes(m)) : P.MODEL_PREF.slice();
+    known.forEach(add);
+    (avail || []).slice().sort((a, b) => rank(a) - rank(b)).forEach(add);
+    if (!list.length && !second) {
+      // tudo marcado como ruim (soluço temporário do Google?): esquece as marcas e tenta os conhecidos
       cache.patch((x) => {
         x.bad = {};
       });
-      P.MODEL_PREF.slice(0, 4).forEach((m) => list.push(m));
+      P.MODEL_PREF.slice(0, 3).forEach((m) => list.push(m));
     }
     return list.slice(0, 5);
   }
@@ -344,83 +377,161 @@ ${JSON.stringify(ctx)}`;
 
   function bodyFor(model, body, thinking, tokens) {
     const b = { ...body, generationConfig: { ...(body.generationConfig || {}), maxOutputTokens: tokens } };
-    // raciocínio curto: respostas mais rápidas e sem gastar o limite de saída "pensando"
+    // raciocínio curto só quando pedido explicitamente (o padrão é o do próprio modelo, como no app de inglês)
     if (thinking && !noThink.has(model)) b.generationConfig.thinkingConfig = { thinkingLevel: thinking };
     return b;
   }
 
-  const backoff = (attempt, hint) => (hint ? Math.min(hint, 8000) : attempt === 1 ? 1200 : 3000) + Math.random() * 600;
 
   function summarize(tried) {
     const codes = tried.map((t) => t.code);
     const has = (c) => codes.includes(c);
     const last = tried[tried.length - 1];
     let msg;
-    if (!tried.length) msg = 'Nenhum modelo disponível para tentar. Confira a chave em Ajustes.';
-    else if (codes.every((c) => c === 'network' || c === 'timeout')) msg = 'Sem conexão com o Gemini. Verifique a internet e tente de novo.';
+    if (!tried.length) msg = 'O tempo acabou antes de qualquer modelo responder. Tente de novo.';
+    else if (codes.every((c) => c === 'network')) msg = 'Sem conexão com o Gemini. Verifique a internet e tente de novo.';
+    else if (codes.every((c) => c === 'network' || c === 'timeout')) msg = `Nenhum modelo respondeu a tempo (${new Set(tried.map((t) => t.model)).size} tentado${new Set(tried.map((t) => t.model)).size > 1 ? 's' : ''}). Pode ser sua internet ou o Google lento agora. Tente de novo.`;
     else if (has('server')) msg = `O Gemini está sobrecarregado agora (tentei ${new Set(tried.map((t) => t.model)).size} modelo(s)). Tente de novo em instantes.`;
     else if (codes.every((c) => c === 'quota')) msg = 'Limite de uso do Gemini atingido nos modelos testados. Espere alguns minutos e tente de novo.';
-    else if (codes.every((c) => c === 'model' || c === 'denied' || c === 'quota')) msg = 'Nenhum dos modelos testados está liberado para a sua chave. Abra Ajustes → Diagnóstico para ver o motivo de cada um.';
+    else if (codes.every((c) => c === 'model' || c === 'denied' || c === 'quota' || c === 'timeout')) msg = 'Nenhum dos modelos testados respondeu para a sua chave. Abra Ajustes → Diagnóstico para ver o motivo de cada um.';
     else msg = `Não consegui falar com o Gemini. Último erro: ${last.message}`;
     const detail = tried.map((t) => `${t.model} · ${t.code}${t.status ? ' ' + t.status : ''} · ${String(t.message).slice(0, 160)}`).join('\n');
     return new GeminiError('all', msg, 0, { tried, detail });
   }
 
   /**
-   * Chama o Gemini com nova tentativa e troca de modelo.
-   * opts: { onStatus(texto), signal, thinking:'low'|…|null, timeoutMs, budgetMs }
+   * Chama o Gemini com troca de modelo, tentativas em paralelo ("hedge") e tempo total limitado.
+   * Começa pelo melhor modelo; se ele não responder em `hedgeMs`, dispara o próximo sem largar o primeiro, e vale
+   * quem responder antes (os outros são cancelados). Erro definitivo (404, sem cota, travou) dispara o próximo já.
+   * opts: { onStatus(texto), signal, thinking:'low'|…|null, timeoutMs, budgetMs, hedgeMs }
    */
   async function generate(body, opts = {}) {
     const apiKey = S.state.settings.apiKey;
     if (!apiKey) throw new GeminiError('nokey', 'Cole sua chave do Gemini em Ajustes para usar o coach.', 0, { fatal: true });
     const status = opts.onStatus || (() => {});
-    const deadline = Date.now() + (opts.budgetMs || 75000);
+    const deadline = Date.now() + (opts.budgetMs || 60000);
+    const hedgeMs = opts.hedgeMs || config.hedgeMs;
+    const perTry = opts.timeoutMs || config.attemptMs;
+    const thinking = opts.thinking === undefined ? null : opts.thinking;
+    const baseTokens = (body.generationConfig && body.generationConfig.maxOutputTokens) || 4096;
     const tried = [];
-    const thinking = opts.thinking === undefined ? 'low' : opts.thinking;
-    let tokens = (body.generationConfig && body.generationConfig.maxOutputTokens) || 4096;
 
     status('Preparando…');
-    const chain = await candidates(apiKey, opts);
+    let chain = await candidates(apiKey, opts);
 
-    for (const model of chain) {
-      let attempt = 0;
-      while (attempt < 3 && Date.now() < deadline) {
-        status(attempt ? `Tentando de novo (${model})…` : `Consultando ${model}…`);
+    // uma chamada a UM modelo: trata "thinking" não suportado e resposta cortada
+    async function attempt(model, signal) {
+      let tokens = baseTokens;
+      for (let n = 0; n < 3; n++) {
+        const left = deadline - Date.now();
+        if (left < 1500) throw new GeminiError('timeout', 'Tempo esgotado.', 0);
         try {
-          const r = await callOnce(model, apiKey, bodyFor(model, body, thinking, tokens), opts);
-          cache.patch((c) => {
-            c.ok = model;
-          });
-          return { text: r.text, model, tried };
+          const r = await callOnce(model, apiKey, bodyFor(model, body, thinking, tokens), { ...opts, signal, timeoutMs: Math.min(perTry, left) });
+          return { text: r.text, model };
         } catch (e) {
           if (!(e instanceof GeminiError)) throw e;
-          tried.push({ model, code: e.code, status: e.status, message: e.raw || e.message });
-          if (e.fatal) throw Object.assign(e, { tried, detail: summarize(tried).detail });
           if (e.code === 'thinking' && !noThink.has(model)) {
-            noThink.add(model); // este modelo não aceita o ajuste: repete sem ele (não conta como tentativa)
+            noThink.add(model); // este modelo não aceita o ajuste: repete sem ele
             continue;
           }
           if (e.code === 'truncated' && tokens < 16384) {
             tokens *= 2;
-            attempt++;
             continue;
           }
-          if (e.code === 'model') {
-            cache.patch((c) => {
-              c.bad = { ...(c.bad || {}), [model]: Date.now() };
-              if (c.list) c.list = c.list.filter((m) => m !== model);
-            });
-            break;
-          }
-          if (e.retry) {
-            attempt++;
-            if (attempt < 3) {
-              await sleep(backoff(attempt, e.retryAfter), opts.signal);
-              continue;
-            }
-          }
-          break;
+          throw e;
         }
+      }
+      throw new GeminiError('empty', 'O modelo não conseguiu completar a resposta.', 0, { retry: true });
+    }
+
+    // uma rodada: dispara os modelos em ordem (com hedge) e resolve com o primeiro sucesso
+    function round(models) {
+      return new Promise((resolve, reject) => {
+        let next = 0;
+        let done = false;
+        let hedge = null;
+        const live = new Map(); // modelo -> AbortController das chamadas em andamento
+        const cut = setTimeout(() => finish(reject, summarize(tried)), Math.max(0, deadline - Date.now()));
+        function finish(fn, v, winner) {
+          if (done) return;
+          done = true;
+          clearTimeout(hedge);
+          clearTimeout(cut);
+          // quem ainda estava pendurado perdeu para um modelo disparado depois: evita por um tempo
+          if (winner) live.forEach((_, m) => m !== winner && markBad(m, config.slowMs));
+          live.forEach((ctl) => ctl.abort());
+          fn(v);
+        }
+        function arm() {
+          clearTimeout(hedge);
+          if (next < models.length) {
+            hedge = setTimeout(() => {
+              if (!done && next < models.length) {
+                status(`Lento… tentando também ${models[next]}`);
+                launch();
+              }
+            }, hedgeMs);
+          }
+        }
+        function launch() {
+          if (done || next >= models.length) return;
+          const model = models[next++];
+          const ctl = new AbortController();
+          live.set(model, ctl);
+          if (opts.signal) {
+            if (opts.signal.aborted) ctl.abort();
+            else opts.signal.addEventListener('abort', () => ctl.abort(), { once: true });
+          }
+          status(`Consultando ${model}…`);
+          arm();
+          attempt(model, ctl.signal).then(
+            (r) => {
+              cache.patch((c) => {
+                c.ok = r.model;
+              });
+              finish(resolve, { ...r, tried }, model);
+            },
+            (e) => {
+              live.delete(model);
+              if (done) return;
+              if (!(e instanceof GeminiError)) return finish(reject, e);
+              tried.push({ model, code: e.code, status: e.status, message: e.raw || e.message });
+              if (e.fatal) return finish(reject, Object.assign(e, { tried, detail: summarize(tried).detail }));
+              if (e.code === 'network') return finish(reject, summarize(tried)); // sem internet: trocar de modelo não ajuda
+              if (e.code === 'model' || e.code === 'denied') markBad(model, config.badMs); // não existe / sem acesso
+              else if (e.code === 'timeout' || (e.code === 'quota' && !e.retry)) markBad(model, config.slowMs);
+              if (next < models.length) launch(); // falhou de vez: o próximo já
+              else if (!live.size) finish(reject, summarize(tried));
+            }
+          );
+        }
+        launch();
+      });
+    }
+
+    for (let pass = 0; pass < 2; pass++) {
+      try {
+        return await round(chain);
+      } catch (e) {
+        if (pass === 1 || !(e instanceof GeminiError) || e.fatal || e.code !== 'all') throw e;
+        const codes = tried.map((t) => t.code);
+        const gone = codes.length > 0 && codes.every((c) => c === 'model' || c === 'denied');
+        const transient = codes.some((c) => c === 'server' || c === 'empty' || c === 'quota' || c === 'truncated');
+        if (Date.now() + 8000 > deadline || !(gone || transient)) throw e;
+        if (gone) {
+          // todos os conhecidos "não existem" para a sua chave: espera a lista do Google e tenta os que ela mostrar
+          status('Procurando modelos disponíveis…');
+          try {
+            await Promise.race([listing || refreshList(apiKey), sleep(6000, opts.signal).then(() => null)]);
+          } catch (e2) {
+            if (e2 instanceof GeminiError && e2.fatal) throw e2;
+          }
+        } else {
+          status('Tentando de novo…');
+          await sleep(2000 + Math.random() * 500, opts.signal);
+        }
+        chain = await candidates(apiKey, opts, true);
+        if (!chain.length) throw e;
       }
     }
     throw summarize(tried);
@@ -445,7 +556,7 @@ ${JSON.stringify(ctx)}`;
   async function ask(history, opts = {}) {
     const out = await generate(
       { systemInstruction: { parts: [{ text: buildSystem() }] }, contents: toContents(history), generationConfig: { maxOutputTokens: 6144 } },
-      opts
+      { timeoutMs: 30000, hedgeMs: 8000, budgetMs: 70000, ...opts }
     );
     return { text: out.text, model: out.model };
   }
@@ -458,7 +569,7 @@ ${JSON.stringify(ctx)}`;
         contents: [{ role: 'user', parts: [{ text: 'Transcreva este áudio.' }, { inline_data: { mime_type: audio.mime, data: audio.b64 } }] }],
         generationConfig: { maxOutputTokens: 2048 },
       },
-      { timeoutMs: 60000, ...opts }
+      { timeoutMs: 40000, hedgeMs: 12000, budgetMs: 90000, ...opts }
     );
     return out.text.replace(/^["“]|["”]$/g, '').trim();
   }
@@ -572,7 +683,7 @@ ${JSON.stringify(ctx)}`;
     const nowMin = U.nowMin();
     let lastErr;
     for (let i = 0; i < 2; i++) {
-      const out = await generate(body, { timeoutMs: 60000, ...opts });
+      const out = await generate(body, { timeoutMs: 40000, hedgeMs: 12000, budgetMs: 90000, ...opts });
       try {
         const res = normalize(parseJSON(out.text), nowMin);
         res.model = out.model;
@@ -587,21 +698,25 @@ ${JSON.stringify(ctx)}`;
 
   const PING = { contents: [{ role: 'user', parts: [{ text: 'Responda apenas com a palavra: ok' }] }], generationConfig: { maxOutputTokens: 1024 } };
 
-  /** Teste rápido: mostra qual modelo respondeu. */
+  /** Teste rápido: mostra qual modelo respondeu. Tempo total limitado (25 s no pior caso). */
   async function test(opts = {}) {
     const t0 = performance.now();
-    const out = await generate(PING, { budgetMs: 40000, ...opts });
+    const out = await generate(PING, { budgetMs: 25000, hedgeMs: 4000, ...opts });
     return { model: out.model, ms: Math.round(performance.now() - t0) };
   }
 
-  /** Diagnóstico: testa cada modelo candidato (uma tentativa só) e devolve o motivo de cada falha. */
+  /**
+   * Diagnóstico: testa vários modelos AO MESMO TEMPO (uma tentativa cada, tempo curto) e mostra o motivo de cada falha.
+   * Termina em poucos segundos mesmo que algum modelo trave. Deixa o melhor que respondeu como preferido.
+   */
   async function diagnose(onUpdate) {
     const apiKey = S.state.settings.apiKey;
     if (!apiKey) throw new GeminiError('nokey', 'Cole a chave primeiro.', 0, { fatal: true });
     const res = { listed: null, listError: null, rows: [] };
+    const push = () => onUpdate && onUpdate(res);
     let avail = null;
     try {
-      avail = await listModels(apiKey);
+      avail = await listModels(apiKey, null, 10000);
       res.listed = avail.length;
       cache.patch((x) => {
         x.list = avail;
@@ -611,43 +726,40 @@ ${JSON.stringify(ctx)}`;
     } catch (e) {
       res.listError = e.message;
       if (e.fatal) {
-        if (onUpdate) onUpdate(res);
+        push();
         return res;
       }
     }
-    const models = (avail && avail.length ? avail.slice().sort((a, b) => rank(a) - rank(b)) : P.MODEL_PREF).slice(0, 6);
-    for (const model of models) {
-      const row = { model, ok: false, ms: 0, code: '', message: '' };
-      res.rows.push(row);
-      if (onUpdate) onUpdate(res);
-      const t0 = performance.now();
-      for (const thinking of ['low', null]) {
-        const b = { ...PING, generationConfig: { ...PING.generationConfig } };
-        if (thinking) b.generationConfig.thinkingConfig = { thinkingLevel: thinking };
+    // os comprovados primeiro; depois o que a chave enxerga, por ranking
+    const pool = avail && avail.length ? [...P.MODEL_PREF.filter((m) => avail.includes(m)), ...avail.slice().sort((a, b) => rank(a) - rank(b))] : P.MODEL_PREF;
+    const models = pool.filter((m, i, a) => a.indexOf(m) === i).slice(0, 6);
+    res.rows = models.map((model) => ({ model, ok: false, ms: 0, code: '', message: '', done: false }));
+    push();
+    await Promise.all(
+      res.rows.map(async (row) => {
+        const t0 = performance.now();
         try {
-          await callOnce(model, apiKey, b, { timeoutMs: 25000 });
+          await callOnce(row.model, apiKey, { ...PING, generationConfig: { ...PING.generationConfig } }, { timeoutMs: config.attemptMs });
           row.ok = true;
-          row.code = '';
-          row.message = thinking ? '' : 'funciona (sem ajuste de raciocínio)';
-          break;
         } catch (e) {
           row.code = e.code || 'erro';
-          row.message = e.raw || e.message;
+          row.message = e.code === 'timeout' ? 'travou: não respondeu em ' + Math.round(config.attemptMs / 1000) + ' s (nome inexistente ou modelo lento)' : e.raw || e.message;
           if (e.code === 'truncated') {
             row.ok = true; // respondeu; só cortou pelo limite minúsculo do teste
-            row.message = 'funciona';
-            break;
+            row.message = '';
           }
-          if (e.code !== 'thinking') break;
+          if (!row.ok && (e.code === 'model' || e.code === 'denied')) markBad(row.model, config.badMs);
+          if (!row.ok && e.code === 'timeout') markBad(row.model, config.slowMs);
         }
-      }
-      row.ms = Math.round(performance.now() - t0);
-      row.done = true;
-      if (row.ok) cache.patch((c) => { c.ok = c.ok || model; });
-      if (onUpdate) onUpdate(res);
-    }
+        row.ms = Math.round(performance.now() - t0);
+        row.done = true;
+        push();
+      })
+    );
+    const best = res.rows.find((r) => r.ok); // rows já está em ordem de preferência
+    if (best) cache.patch((c) => { c.ok = best.model; });
     return res;
   }
 
-  g.Gemini = { ask, transcribe, interpret, test, diagnose, resetCache, buildContext, buildSystem, buildInterpretSystem, toContents, normalize, parseJSON, GeminiError };
+  g.Gemini = { config, ask, transcribe, interpret, test, diagnose, resetCache, buildContext, buildSystem, buildInterpretSystem, toContents, normalize, parseJSON, GeminiError };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -35,7 +35,7 @@
     t.classList.toggle('act', !!act);
     t.classList.add('show');
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => t.classList.remove('show'), act ? 7000 : 2800);
+    toast._t = setTimeout(() => t.classList.remove('show'), act ? 7000 : Math.min(9000, Math.max(2800, String(msg).length * 55)));
   }
 
   /** Chuva rápida de emojis para comemorar uma meta. */
@@ -1151,15 +1151,28 @@
     async 'test-gemini'(el) {
       el.disabled = true;
       const label = el.textContent;
-      el.textContent = 'Testando…';
+      const t0 = Date.now();
+      let status = 'Testando…';
+      const paint = () => {
+        el.textContent = `${status} ${Math.round((Date.now() - t0) / 1000)} s`;
+      };
+      const iv = setInterval(paint, 500);
+      paint();
       try {
-        const r = await G.test();
+        const r = await G.test({
+          onStatus: (t) => {
+            status = t;
+            paint();
+          },
+        });
         toast(`Conectado ✓ ${r.model} (${(r.ms / 1000).toFixed(1)} s)`);
       } catch (e) {
-        toast(e.message);
+        toast(e.message + (e.detail ? ' Toque em Diagnóstico para ver o motivo de cada modelo.' : ''));
+      } finally {
+        clearInterval(iv);
+        el.disabled = false;
+        el.textContent = label;
       }
-      el.disabled = false;
-      el.textContent = label;
     },
     ics: () => ICS.download(),
     async 'test-notif'() {

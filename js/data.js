@@ -239,7 +239,9 @@
 
   // 'auto' = o app pergunta à API quais modelos a SUA chave enxerga e usa o melhor disponível.
   // Ordem de preferência (docs do Gemini, out/2026): os 2.5 só funcionam para quem já os usava.
-  const MODEL_PREF = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  // Ordem de preferência. Os dois primeiros foram testados e respondem rápido; os mais novos ficam depois porque
+  // um nome que não existe NÃO dá erro: a chamada fica pendurada até estourar o tempo.
+  const MODEL_PREF = ['gemini-3.1-flash-lite', 'gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3-flash-preview', 'gemini-2.5-flash-lite'];
   const MODELS = ['auto', ...MODEL_PREF.slice(0, 5)];
   // modelos que já foram o padrão do app mas não existem na API: migrados para 'auto'
   const MODELS_MORTOS = ['gemini-3.7-flash'];
