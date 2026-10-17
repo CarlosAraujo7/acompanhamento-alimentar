@@ -1,8 +1,8 @@
 /* Service worker: rede primeiro (sempre a versão mais nova), cache como reserva offline. */
-const CACHE = 'plano-v1';
+const CACHE = 'plano-v2';
 const ASSETS = [
   './', 'index.html', 'manifest.webmanifest', 'css/style.css',
-  'js/util.js', 'js/data.js', 'js/store.js', 'js/charts.js', 'js/gemini.js', 'js/ics.js', 'js/app.js',
+  'js/util.js', 'js/data.js', 'js/store.js', 'js/charts.js', 'js/gemini.js', 'js/voice.js', 'js/ics.js', 'js/app.js', 'js/voiceui.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon.png',
 ];
 

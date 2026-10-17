@@ -11,12 +11,12 @@
   function defaults() {
     const hoje = U.key();
     return {
-      v: 1,
+      v: 2,
       // valores neutros só para o app abrir; os reais são digitados na 1ª abertura (profile.ok) e ficam só no aparelho
       profile: { ok: false, nome: '', idade: 30, altura: 170, pesoInicial: 100, inicio: hoje, meta1: 90, metaFinal: 75, ritmo: 1.2 },
       settings: {
         apiKey: '',
-        model: P.MODELS[0],
+        model: 'auto',
         kcal: P.TARGETS.kcal,
         proteina: P.TARGETS.proteina,
         carbo: P.TARGETS.carbo,
@@ -29,6 +29,7 @@
         notif: false,
         tema: 'auto',
         sobreMim: '',
+        falar: false,
       },
       days: {},
       weights: [],
@@ -38,7 +39,8 @@
   }
 
   function emptyDay() {
-    return { meals: {}, agua: 0, refri: 0, caminhada: 0, extras: [], fissuras: [], fechou: false };
+    // foods = o que foi contado por voz/texto; treinos = treinos em casa e afins (ambos com estimativa da IA)
+    return { meals: {}, agua: 0, refri: 0, caminhada: 0, extras: [], fissuras: [], fechou: false, foods: [], treinos: [] };
   }
 
   function deepMerge(base, extra) {
@@ -61,6 +63,13 @@
     e.kg = state.profile.pesoInicial;
   }
 
+  /** Ajustes de versões antigas: o modelo padrão antigo não existe na API e quebrava o coach. */
+  function migrate() {
+    const set = state.settings;
+    if (!set.model || P.MODELS_MORTOS.includes(set.model)) set.model = 'auto';
+    state.v = 2;
+  }
+
   function load() {
     const base = defaults();
     try {
@@ -71,6 +80,7 @@
     }
     state = base;
     for (const k of Object.keys(state.days)) state.days[k] = Object.assign(emptyDay(), state.days[k]);
+    migrate();
     syncSeed();
     return state;
   }
@@ -110,6 +120,12 @@
     return U.diffDays(state.profile.inicio, k) + 1;
   }
 
+  const foodsOf = (d, mealId) => d.foods.filter((f) => f.meal === mealId);
+  /** Refeição feita = marcada no plano OU com algo contado por voz/texto. */
+  const mealDone = (d, id) => foodsOf(d, id).length > 0 || !!(d.meals[id] && d.meals[id].done);
+  /** O que foi contado vale mais que o plano: se a refeição tem itens contados, o plano marcado não soma. */
+  const planCounts = (d, id) => !foodsOf(d, id).length && !!(d.meals[id] && d.meals[id].done);
+
   function dayStats(k) {
     const set = state.settings;
     const d = peekDay(k);
@@ -117,29 +133,42 @@
     let kcal = 0, p = 0, c = 0, f = 0, done = 0, req = 0;
     for (const m of P.MEALS) {
       if (!m.opcional) req++;
-      const md = d.meals[m.id];
-      if (md && md.done) {
+      if (planCounts(d, m.id)) {
         const t = P.optTotals(m.opcoes[optIndex(k, m)]);
         kcal += t.k; p += t.p; c += t.c; f += t.f;
-        if (!m.opcional) done++;
       }
+      if (mealDone(d, m.id) && !m.opcional) done++;
     }
-    const extrasK = d.extras.reduce((a, e) => a + e.kcal, 0);
-    kcal += extrasK;
+    for (const x of d.foods) {
+      kcal += x.kcal; p += x.p; c += x.c; f += x.f;
+    }
+    const manualK = d.extras.reduce((a, e) => a + e.kcal, 0);
+    kcal += manualK;
+    // "fora do plano" = extras digitados à mão + itens que a IA (ou você) marcou como fora do plano
+    const fora = d.foods.filter((x) => x.fora);
+    const extrasK = Math.round(manualK + fora.reduce((a, x) => a + x.kcal, 0));
+    const extrasN = d.extras.length + fora.length;
+
+    const treinoMin = d.treinos.reduce((a, t) => a + t.min, 0);
+    const treinoK = d.treinos.reduce((a, t) => a + t.kcal, 0);
+    const move = d.caminhada + treinoMin;
 
     const closed = !!d.fechou || k < hoje;
     const parts = {
       refeicoes: req ? (40 * done) / req : 0,
       agua: 15 * U.clamp(d.agua / set.agua, 0, 1),
-      caminhada: 15 * U.clamp(d.caminhada / set.caminhada, 0, 1),
+      caminhada: 15 * U.clamp(move / set.caminhada, 0, 1),
       refri: closed && d.refri <= set.refriMax ? 10 : 0,
-      cozinha: closed && d.extras.length === 0 ? 20 : 0,
+      cozinha: closed && extrasN === 0 ? 20 : 0,
     };
-    const hasData = done > 0 || d.agua > 0 || d.caminhada > 0 || d.extras.length > 0 || d.fechou;
+    const hasData = done > 0 || d.foods.length > 0 || d.agua > 0 || move > 0 || extrasN > 0 || d.fechou;
     const score = hasData ? Math.round(Object.values(parts).reduce((a, b) => a + b, 0)) : null;
     const venci = d.fissuras.filter((x) => x.won).length;
     const cedi = d.fissuras.length - venci;
-    return { kcal, p, c, f, done, req, extrasK, parts, closed, hasData, score, venci, cedi };
+    return {
+      kcal: Math.round(kcal), p: Math.round(p), c: Math.round(c), f: Math.round(f), done, req,
+      extrasK, extrasN, treinoMin, treinoK: Math.round(treinoK), move, parts, closed, hasData, score, venci, cedi,
+    };
   }
 
   function streak() {
@@ -191,6 +220,94 @@
     return den ? (pts.reduce((s, q) => s + (q[0] - mx) * (q[1] - my), 0) / den) * 7 : null;
   }
 
+  // ---- Registro por voz/texto ----------------------------------------------
+  /** Refeição mais perto do horário (em minutos). Depois da cozinha fechar, vira "fora de hora". */
+  function guessMeal(nowMin = U.nowMin()) {
+    if (nowMin >= U.minutes(state.settings.cozinhaFecha)) return 'ex';
+    let best = null;
+    for (const m of P.MEALS) {
+      const diff = Math.abs(U.minutes(mealTime(m)) - nowMin);
+      if (!best || diff < best.diff) best = { id: m.id, diff };
+    }
+    return best.id;
+  }
+
+  /**
+   * Grava no dia o que a IA entendeu (já revisado por você). Devolve um "recibo" com o que mudou,
+   * para o botão Desfazer.
+   * e = { comidas:[{meal,nome,kcal,p,c,f,fora,motivo,obs}], treinos:[{tipo,min,kcal,obs}], agua, refri, caminhada, peso }
+   */
+  function applyEntry(k, e, src = 'voz') {
+    const d = day(k);
+    const rec = { k, foods: [], treinos: [], agua: 0, refri: 0, caminhada: 0, peso: null, plano: [] };
+    const ts = Date.now();
+    for (const x of e.comidas || []) {
+      const md = d.meals[x.meal];
+      // o que você contou substitui o plano marcado daquela refeição
+      if (md && md.done && !rec.plano.some((q) => q.id === x.meal)) {
+        rec.plano.push({ id: x.meal, opt: md.opt, at: md.at });
+        md.done = false;
+        md.at = null;
+      }
+      const id = U.uid();
+      d.foods.push({ id, ts, src, meal: x.meal, nome: x.nome, kcal: x.kcal, p: x.p, c: x.c, f: x.f, fora: !!x.fora, motivo: x.motivo || '', obs: x.obs || '' });
+      rec.foods.push(id);
+    }
+    for (const t of e.treinos || []) {
+      const id = U.uid();
+      d.treinos.push({ id, ts, src, tipo: t.tipo, min: t.min, kcal: t.kcal, obs: t.obs || '' });
+      rec.treinos.push(id);
+    }
+    if (e.agua > 0) { d.agua += e.agua; rec.agua = e.agua; }
+    if (e.refri > 0) { d.refri += e.refri; rec.refri = e.refri; }
+    if (e.caminhada > 0) { d.caminhada += e.caminhada; rec.caminhada = e.caminhada; }
+    if (e.peso > 0) {
+      const same = state.weights.find((w) => w.date === k && !w.inicial);
+      if (same) {
+        rec.peso = { id: same.id, prev: same.kg, novo: false };
+        same.kg = e.peso;
+      } else {
+        const w = { id: U.uid(), date: k, kg: e.peso, cintura: null };
+        state.weights.push(w);
+        rec.peso = { id: w.id, prev: null, novo: true };
+      }
+    }
+    save();
+    return rec;
+  }
+
+  function undoEntry(rec) {
+    const d = day(rec.k);
+    d.foods = d.foods.filter((x) => !rec.foods.includes(x.id));
+    d.treinos = d.treinos.filter((x) => !rec.treinos.includes(x.id));
+    d.agua = Math.max(0, d.agua - rec.agua);
+    d.refri = Math.max(0, d.refri - rec.refri);
+    d.caminhada = Math.max(0, d.caminhada - rec.caminhada);
+    for (const q of rec.plano) {
+      const md = d.meals[q.id];
+      if (md && !foodsOf(d, q.id).length) { md.done = true; md.at = q.at; md.opt = q.opt; }
+    }
+    if (rec.peso) {
+      if (rec.peso.novo) state.weights = state.weights.filter((w) => w.id !== rec.peso.id);
+      else {
+        const w = state.weights.find((q) => q.id === rec.peso.id);
+        if (w) w.kg = rec.peso.prev;
+      }
+    }
+    save();
+  }
+
+  function removeFood(k, id) {
+    const d = day(k);
+    d.foods = d.foods.filter((x) => x.id !== id);
+    save();
+  }
+  function removeTreino(k, id) {
+    const d = day(k);
+    d.treinos = d.treinos.filter((x) => x.id !== id);
+    save();
+  }
+
   // ---- Backup --------------------------------------------------------------
   function exportJSON() {
     const copy = JSON.parse(JSON.stringify(state));
@@ -210,6 +327,7 @@
     if (!base.settings.apiKey) base.settings.apiKey = keepKey;
     state = base;
     for (const k of Object.keys(state.days)) state.days[k] = Object.assign(emptyDay(), state.days[k]);
+    migrate();
     syncSeed();
     save();
   }
@@ -226,7 +344,8 @@
     SCORE_OK,
     load, save, reset, exportJSON, importJSON, syncSeed,
     get state() { return state; },
-    peekDay, day, mealTime, pool, optIndex, planDay, dayStats, streak,
+    peekDay, day, mealTime, pool, optIndex, planDay, dayStats, streak, foodsOf, mealDone, planCounts,
+    guessMeal, applyEntry, undoEntry, removeFood, removeTreino,
     weightsSorted, currentWeight, bmi, ma7, trend,
   };
 })(window);

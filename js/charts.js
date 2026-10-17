@@ -4,18 +4,79 @@
   const U = g.U;
   const S = g.Store;
 
-  /** Anel de progresso. */
-  function ring({ pct, size = 132, stroke = 12, color = 'var(--accent)', big, small, label }) {
-    const r = (size - stroke) / 2;
+  /**
+   * Arco de um anel. Com `key`, o app anima do valor anterior até o novo (data-fx, ver runFx em app.js).
+   * Sem progresso, não desenha o arco (a ponta arredondada apareceria como um ponto).
+   */
+  function arc({ m, r, stroke, pct, color, key }) {
     const c = 2 * Math.PI * r;
-    const off = c * (1 - U.clamp(pct, 0, 1));
+    const p = U.clamp(pct, 0, 1);
+    const off = c * (1 - p);
+    const fx = key ? `class="arc" data-fx="${key}" data-prop="dash" data-from="${c.toFixed(1)}" data-to="${off.toFixed(1)}"` : '';
+    return `<circle cx="${m}" cy="${m}" r="${r}" fill="none" stroke="var(--line)" stroke-width="${stroke}" opacity=".5"/>
+      <circle ${fx} cx="${m}" cy="${m}" r="${r}" fill="none" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"
+        stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" stroke-opacity="${p > 0.004 ? 1 : 0}" transform="rotate(-90 ${m} ${m})"/>`;
+  }
+
+  /** Anel de progresso. */
+  function ring({ pct, size = 132, stroke = 12, color = 'var(--accent)', big, small, label, key }) {
     const m = size / 2;
     return `<svg class="ring" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" role="img" aria-label="${U.esc(label || '')}">
-      <circle cx="${m}" cy="${m}" r="${r}" fill="none" stroke="var(--line)" stroke-width="${stroke}"/>
-      <circle cx="${m}" cy="${m}" r="${r}" fill="none" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"
-        stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 ${m} ${m})"/>
+      ${arc({ m, r: (size - stroke) / 2, stroke, pct, color, key })}
       <text x="${m}" y="${m + 2}" text-anchor="middle" class="ring-big">${U.esc(big)}</text>
       <text x="${m}" y="${m + 20}" text-anchor="middle" class="ring-small">${U.esc(small)}</text>
+    </svg>`;
+  }
+
+  /** Anéis concêntricos (estilo "atividade"): items = [{ pct, color, key }] de fora para dentro. */
+  function rings(items, { size = 168, stroke = 12, gap = 5, big, small, label } = {}) {
+    const m = size / 2;
+    const arcs = items
+      .map((it, i) => arc({ m, r: m - stroke / 2 - 2 - i * (stroke + gap), stroke, pct: it.pct, color: it.color, key: it.key }))
+      .join('');
+    return `<svg class="ring rings" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" role="img" aria-label="${U.esc(label || '')}">
+      ${arcs}
+      <text x="${m}" y="${m + 4}" text-anchor="middle" class="ring-big">${U.esc(big)}</text>
+      <text x="${m}" y="${m + 22}" text-anchor="middle" class="ring-small">${U.esc(small)}</text>
+    </svg>`;
+  }
+
+  /** Calorias dos últimos 7 dias contra a meta (barra = dia; cor = pontos do dia). */
+  function weekBars() {
+    const hoje = U.key();
+    const set = S.state.settings;
+    const W = 340, H = 150, pad = { l: 8, r: 8, t: 14, b: 22 };
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+      const k = U.addDays(hoje, -i);
+      const ok = k >= S.state.profile.inicio;
+      const s = ok ? S.dayStats(k) : null;
+      days.push({ k, s: s && s.hasData ? s : null });
+    }
+    const max = Math.max(set.kcal * 1.25, ...days.map((d) => (d.s ? d.s.kcal : 0)));
+    const bw = (W - pad.l - pad.r) / 7;
+    const y = (v) => pad.t + (1 - v / max) * (H - pad.t - pad.b);
+    const goalY = y(set.kcal);
+    let bars = '';
+    days.forEach((d, i) => {
+      const x = pad.l + i * bw + bw * 0.18;
+      const w = bw * 0.64;
+      const label = U.parse(d.k).toLocaleDateString('pt-BR', { weekday: 'narrow' }).toUpperCase();
+      if (d.s) {
+        const sc = d.s.score == null ? 0 : d.s.score;
+        const cls = d.s.kcal > set.kcal * 1.05 ? 'r' : sc >= S.SCORE_OK ? 'g' : sc >= 50 ? 'y' : 'r';
+        const top = y(d.s.kcal);
+        bars += `<rect class="wb ${cls}" x="${x.toFixed(1)}" y="${top.toFixed(1)}" width="${w.toFixed(1)}" height="${(H - pad.b - top).toFixed(1)}" rx="6"><title>${U.dateLabel(d.k)} · ${d.s.kcal} kcal · ${sc} pts</title></rect>
+          <text class="wv" x="${(x + w / 2).toFixed(1)}" y="${(top - 4).toFixed(1)}" text-anchor="middle">${d.s.kcal}</text>`;
+      } else {
+        bars += `<rect class="wb n" x="${x.toFixed(1)}" y="${(H - pad.b - 4).toFixed(1)}" width="${w.toFixed(1)}" height="4" rx="2"/>`;
+      }
+      bars += `<text class="wl${d.k === hoje ? ' today' : ''}" x="${(x + w / 2).toFixed(1)}" y="${H - 6}" text-anchor="middle">${label}</text>`;
+    });
+    return `<svg class="wbars" viewBox="0 0 ${W} ${H}" role="img" aria-label="Calorias dos últimos 7 dias">
+      <line class="wgoal" x1="${pad.l}" x2="${W - pad.r}" y1="${goalY.toFixed(1)}" y2="${goalY.toFixed(1)}"/>
+      <text class="wgoal-t" x="${W - pad.r}" y="${(goalY - 4).toFixed(1)}" text-anchor="end">meta ${set.kcal}</text>
+      ${bars}
     </svg>`;
   }
 
@@ -87,5 +148,5 @@
     return `<div class="hm">${head}${cells}</div>`;
   }
 
-  g.Charts = { ring, weightChart, heatmap };
+  g.Charts = { ring, rings, weekBars, weightChart, heatmap };
 })(window);
